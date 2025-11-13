@@ -1,193 +1,138 @@
-# ITCS-6190 Assignment 3: AWS Data Processing Pipeline
+# ITCS-6190 Assignment 3 – AWS Native Data Pipeline
 
-This project demonstrates an end-to-end serverless data processing pipeline on AWS. The process involves ingesting raw data into S3, using a Lambda function to process it, cataloging the data with AWS Glue, and finally, querying and visualizing the results on a dynamic webpage hosted on an EC2 instance.
-
-## 1. Amazon S3 Bucket Structure 🪣
-
-First, set up an S3 bucket with the following folder structure to manage the data workflow:
-
-* **`bucket-name/`**
-    * **`raw/`**: For incoming raw data files.
-    * **`processed/`**: For cleaned and filtered data output by the Lambda function.
-    * **`enriched/`**: For storing athena query results.
+**Student:** SaiKiran (801484665)  
+**Course:** ITCS-6190 Cloud Computing for Data Analysis  
+**Date:** 11 Nov 2025
 
 ---
 
-## 2. IAM Roles and Permissions 🔐
-
-Create the following IAM roles to grant AWS services the necessary permissions to interact with each other securely.
-
-### Lambda Execution Role
-
-1.  Navigate to **IAM** -> **Roles** and click **Create role**.
-2.  **Trusted entity type**: Select **AWS service**.
-3.  **Use case**: Select **Lambda**.
-4.  **Add Permissions**: Attach the following managed policies:
-    * `AWSLambdaBasicExecutionRole`
-    * `AmazonS3FullAccess`
-5.  Give the role a descriptive name (e.g., `Lambda-S3-Processing-Role`) and create it.
-
-### Glue Service Role
-
-1.  Create another IAM role for **AWS service** with the use case **Glue**.
-2.  **Add Permissions**: Attach the following policies:
-    * `AmazonS3FullAccess`
-    * `AWSGlueConsoleFullAccess`
-    * `AWSGlueServiceRole`
-3.  Name the role (e.g., `Glue-S3-Crawler-Role`) and create it.
-
-### EC2 Instance Profile
-
-1.  Create a final IAM role for **AWS service** with the use case **EC2**.
-2.  **Add Permissions**: Attach the following policies:
-    * `AmazonS3FullAccess`
-    * `AmazonAthenaFullAccess`
-3.  Name the role (e.g., `EC2-Athena-Dashboard-Role`) and create it.
+**Workflow Overview**
+1. Organize storage in Amazon S3 for raw, processed, and enriched data tiers.
+2. Create IAM roles so Lambda, Glue, and EC2 can talk to S3/Athena securely.
+3. Author a Python Lambda function that cleans the uploaded CSV.
+4. Attach an S3 trigger so every new file is processed immediately.
+5. Confirm the processed object lands in the correct prefix.
+6. Run a Glue crawler and inspect CloudWatch logs for schema discovery.
+7. Use Athena to query the curated dataset and keep results in S3.
+8. Expose the query outputs on an EC2-hosted dashboard.
 
 ---
 
-## 3. Create the Lambda Function ⚙️
+## 1. Amazon S3 Data Zones
+- Bucket: assignment bucket (N. Virginia)
+- Prefixes:
+  - `raw/` for incoming uploads such as `Orders.csv`.
+  - `processed/` for Lambda outputs named `filtered_<file>.csv`.
+  - `enriched/` for Athena result sets consumed by the dashboard.
+- Rationale: Separating each lifecycle stage simplifies IAM scoping, keeps ingestion immutable, and provides a clear audit trail when troubleshooting.
 
-This function will automatically process files uploaded to the `raw/` S3 folder.
-
-1.  Navigate to the **Lambda** service in the AWS Console.
-2.  Click **Create function**.
-3.  Select **Author from scratch**.
-4.  **Function name**: `FilterAndProcessOrders`
-5.  **Runtime**: Select **Python 3.9** (or a newer version).
-6.  **Permissions**: Expand *Change default execution role*, select **Use an existing role**, and choose the **Lambda Execution Role** you created.
-7.  Click **Create function**.
-8.  In the **Code source** editor, replace the default code with LambdaFunction.py code for processing the raw data.
+![S3 bucket layout](screenshots/1.png)
 
 ---
 
-## 4. Configure the S3 Trigger ⚡
+## 2. IAM Roles That Glue The Services Together
+| Role | Purpose | Key Policies |
+| --- | --- | --- |
+| `Lambda-S3-Processing-Role` | Lets Lambda read raw objects, write processed files, and publish logs. | `AWSLambdaBasicExecutionRole`, `AmazonS3FullAccess` |
+| `Glue-S3-Crawler-Role` | Allows the crawler to inspect processed objects and update the catalog. | `AmazonS3FullAccess`, `AWSGlueConsoleFullAccess`, `AWSGlueServiceRole` |
+| `EC2-Athena-Dashboard-Role` | Empowers the EC2 instance to submit Athena queries and fetch their outputs. | `AmazonS3FullAccess`, `AmazonAthenaFullAccess` |
 
-Set up the S3 trigger to invoke your Lambda function automatically.
+Each role follows least-privilege principles so secrets never get embedded in code.
 
-1.  In the Lambda function overview, click **+ Add trigger**.
-2.  **Source**: Choose **S3**.
-3.  **Bucket**: Select your S3 bucket.
-4.  **Event types**: Choose **All object create events**.
-5.  **Prefix (Required)**: Enter `raw/`. This ensures the function only triggers for files in this folder.
-6.  **Suffix (Recommended)**: Enter `.csv`.
-7.  Check the acknowledgment box and click **Add**.
-
---- 
-**Start Processing of Raw Data**: Now upload the Orders.csv file into the `raw/` folder of the S3 Bucket. This will automatically trigger the Lambda function.
----
-
-## 5. Create a Glue Crawler 🕸️
-
-The crawler will scan your processed data and create a data catalog, making it queryable by Athena.
-
-1.  Navigate to the **AWS Glue** service.
-2.  In the left pane, select **Crawlers** and click **Create crawler**.
-3.  **Name**: `orders_processed_crawler`.
-4.  **Data source**: Point the crawler to the `processed/` folder in your S3 bucket.
-5.  **IAM Role**: Select the **Glue Service Role** you created earlier.
-6.  **Output**: Click **Add database** and create a new database named `orders_db`.
-7.  Finish the setup and run the crawler. It will create a new table in your `orders_db` database.
+![IAM roles overview](screenshots/2.png)
 
 ---
 
-## 6. Query Data with Amazon Athena 🔍
+## 3. Lambda Function – `FilterAndProcessOrders`
+- Runtime: Python 3.9
+- Handler logic:
+  1. Load the uploaded CSV from `raw/` using boto3.
+  2. Drop orders that are either `pending` or `cancelled` **and** older than 30 days.
+  3. Preserve the rest (recent activity plus all committed shipments).
+  4. Save the cleaned data to `processed/filtered_<filename>.csv`.
+  5. Log total vs. retained counts for traceability.
+- Execution role: `Lambda-S3-Processing-Role`
+- Timeout raised to 60 seconds so larger CSVs finish without retries.
 
-Navigate to the **Athena** service. Ensure your data source is set to `AwsDataCatalog` and the database is `orders_db`. You can now run SQL queries on your processed data.
-
-**Queries to be executed:**
-* **Total Sales by Customer**: Calculate the total amount spent by each customer.
-* **Monthly Order Volume and Revenue**: Aggregate the number of orders and total revenue per month.
-* **Order Status Dashboard**: Summarize orders based on their status (`shipped` vs. `confirmed`).
-* **Average Order Value (AOV) per Customer**: Find the average amount spent per order for each customer.
-* **Top 10 Largest Orders in February 2025**: Retrieve the highest-value orders from a specific month.
-
----
-
-## 7. Launch the EC2 Web Server 🖥️
-
-This instance will host a simple web page to display the Athena query results.
-
-1.  Navigate to the **EC2** service and click **Launch instance**.
-2.  **Name**: `Athena-Dashboard-Server`.
-3.  **Application and OS Images**: Select **Amazon Linux 2023 AMI**.
-4.  **Instance type**: Choose **t2.micro** (Free tier eligible).
-5.  **Key pair (login)**: Create and download a new key pair. **Save the `.pem` file!**
-6.  **Network settings**: Click **Edit** and configure the security group:
-    * **Rule 1 (SSH)**: Type: `SSH`, Port: `22`, Source: `My IP`.
-    * **Rule 2 (Web App)**: Click **Add security group rule**.
-        * Type: `Custom TCP`
-        * Port Range: `5000`
-        * Source: `Anywhere` (`0.0.0.0/0`)
-7.  **Advanced details**: Scroll down and for **IAM instance profile**, select the **EC2 Instance Profile** you created.
-8.  Click **Launch instance**.
+![Lambda function configuration](screenshots/3.png)
 
 ---
 
-## 8. Connect to Your EC2 Instance
+## 4. Event-Driven Processing With S3 Triggers
+- Source bucket: assignment bucket
+- Event type: `ObjectCreated`
+- Filters: prefix `raw/`, suffix `.csv`
+- Outcome: Uploading `Orders.csv` immediately invokes the Lambda, eliminating manual runs or cron jobs.
 
-1.  From the EC2 dashboard, select your instance and copy its **Public IPv4 address**.
-2.  Open a terminal or SSH client and connect using your key pair:
-
-    ```bash
-    ssh -i /path/to/your-key-file.pem ec2-user@YOUR_PUBLIC_IP_ADDRESS
-    ```
-
----
-
-## 9. Set Up the Web Environment
-
-Once connected via SSH, run the following commands to install the necessary software.
-
-1.  **Update system packages**:
-    ```bash
-    sudo yum update -y
-    ```
-2.  **Install Python and Pip**:
-    ```bash
-    sudo yum install python3-pip -y
-    ```
-3.  **Install Python libraries (Flask & Boto3)**:
-    ```bash
-    pip3 install Flask boto3
-    ```
+![S3 trigger details](screenshots/4.png)
 
 ---
 
-## 10. Create and Configure the Web Application
+## 5. Verifying The Processed Output
+Once the trigger fires, the Lambda writes `processed/filtered_Orders.csv`. This checkpoint proves the wiring works end-to-end and that the pipeline is ready for Glue.
 
-1.  Create the application file using the `nano` text editor:
-    ```bash
-    nano app.py
-    ```
-2.  Copy and paste your Python web application code (`EC2InstanceNANOapp.py`) into the editor.
-
-3.  ‼️ **Important**: Update the placeholder variables at the top of the script:
-    * `AWS_REGION`: Your AWS region (e.g., `us-east-1`).
-    * `ATHENA_DATABASE`: The name of your Glue database (e.g., `orders_db`).
-    * `S3_OUTPUT_LOCATION`: The S3 URI for your Athena query results (e.g., `s3://your-athena-results-bucket/`).
-
-4.  Save the file and exit `nano` by pressing `Ctrl + X`, then `Y`, then `Enter`.
+![Processed CSV in S3](screenshots/5.png)
 
 ---
 
-## 11. Run the App and View Your Dashboard! 🚀
+## 6. Glue Crawler & CloudWatch Evidence
+- Crawler name: `orders_processed_crawler`
+- Data store: `s3://<assignment-bucket>/processed/`
+- Destination database: `orders_db`
+- IAM role: `Glue-S3-Crawler-Role`
+- Validation: Checked CloudWatch logs to verify that the crawler completed successfully and registered the `processed` table with the detected schema.
 
-1.  Execute the Python script to start the web server:
-    ```bash
-    python3 app.py
-    ```
-    You should see a message like `* Running on http://0.0.0.0:5000/`.
-
-2.  Open a web browser and navigate to your instance's public IP address on port 5000:
-    ```
-    http://YOUR_PUBLIC_IP_ADDRESS:5000
-    ```
-    You should now see your Athena Orders Dashboard!
+![Crawler CloudWatch logs](screenshots/6.png)
 
 ---
 
-## Important Final Notes
+## 7. Athena Queries And Enriched Folder
+Using the AWS Glue catalog, I issued the following Athena queries (Trino engine) against `orders_db.processed`:
+- Customer-level revenue totals
+- Monthly order volume and revenue aggregation
+- Order status distribution (confirmed vs. shipped vs. other)
+- Average order value per customer
+- Top 10 highest order amounts in Feb 2025
 
-* **Stopping the Server**: To stop the Flask application, return to your SSH terminal and press `Ctrl + C`.
-* **Cost Management**: This setup uses free-tier services. To prevent unexpected charges, **stop or terminate your EC2 instance** from the AWS console when you are finished.
+Query results write to `s3://<assignment-bucket>/enriched/`, keeping historical outputs that the dashboard can reuse without rerunning every query.
+
+![Athena result files in enriched folder](screenshots/7.png)
+
+---
+
+## 8. EC2-Hosted Dashboard
+- Instance: Amazon Linux 2023 `t2.micro` with a security group that allows SSH from my IP and TCP 5000 for the web UI.
+- IAM instance profile: `EC2-Athena-Dashboard-Role` (grants Athena/S3 access).
+- Application stack: Flask + boto3 (`EC2InstanceNANOapp..py`).
+- Behavior: On page load, the app fires the same five Athena queries, waits for completion, retrieves the CSV outputs, and renders them as HTML tables labeled on the dashboard.
+
+![Final webpage showing Athena insights](screenshots/8.png)
+
+---
+
+## Lessons Learned & Cleanup Tips
+- Event-driven architectures drastically cut manual intervention; Lambda + S3 triggers handled every upload automatically.
+- IAM roles removed the need for static credentials while still enabling service-to-service calls.
+- Monitoring (CloudWatch logs for Lambda/Glue) shortened debug cycles when validating the pipeline.
+- Everything stayed inside the AWS Free Tier thanks to tiny datasets and short runtimes.
+- After grading, stop or terminate the EC2 instance, empty/delete the S3 bucket, remove the Lambda function, delete the Glue crawler/database, and detach IAM roles to avoid lingering costs.
+
+---
+
+## Repository Map
+```
+.
+├── EC2InstanceNANOapp..py  # Flask application executed on the EC2 host
+├── LambdaFunction.py        # Python handler deployed to AWS Lambda
+├── orders.csv               # Example raw dataset used for testing
+├── README.md                # Documentation (this file)
+└── screenshots/             # Evidence requested in the assignment
+    ├── 1.png  # S3 bucket layout
+    ├── 2.png  # IAM roles
+    ├── 3.png  # Lambda function
+    ├── 4.png  # S3 trigger
+    ├── 5.png  # Processed CSV
+    ├── 6.png  # Glue crawler logs
+    ├── 7.png  # Athena enriched outputs
+    └── 8.png  # Final webpage
+```
